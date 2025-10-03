@@ -1,18 +1,20 @@
 
-LVGL Weather Station Demo
+# LVGL Weather Station Demo
 
-Overview
+## Overview
 - A minimal weather dashboard built with LVGL (v8 style API) that targets the Linux framebuffer (fbdev) for display output and evdev for input. It renders four widgets (temperature, pressure, humidity, time) and periodically refreshes their data using a background thread that simulates weather API calls.
 - The default configuration is Linux-only (fbdev/evdev). For macOS and Windows, use an SDL-based desktop backend or run under Linux/WSL.
 
-Repository layout
+## Repository layout
 - main.c: Application entry point, UI creation, threads, and HAL init
 - Makefile: Build, clean, Linux dependency install, and LVGL/lv_drivers setup
 - lv_conf.h: LVGL configuration (fonts, logging, resolution, etc.)
 - lv_drv_conf.h: LVGL driver configuration (fbdev/evdev paths, etc.)
 
-Build and run: quick start
-Linux (Debian/Ubuntu, Raspberry Pi, etc.)
+## Build and run: quick start
+
+### Linux (Debian/Ubuntu, Raspberry Pi, etc.)
+
 1) Install prerequisites
    sudo apt-get update
    sudo apt-get install -y build-essential git
@@ -46,7 +48,8 @@ Linux (Debian/Ubuntu, Raspberry Pi, etc.)
 
    If the input device path is different (e.g., event2), edit lv_drv_conf.h and set EVDEV_NAME accordingly.
 
-macOS
+### macOS
+
 The default fbdev/evdev configuration is Linux-specific. On macOS, you have two options:
 - Option A (recommended for macOS): build with the SDL backend (desktop window)
 - Option B: run a Linux VM/Container with framebuffer support and use the Linux steps
@@ -66,12 +69,13 @@ Option A: SDL desktop build (macOS)
    make clean && make USE_SDL_BACKEND=1
    ./weather_app
 
-Windows
+### Windows
 On Windows you can:
 - Option A (simplest): use WSL2 (Ubuntu) and follow the Linux steps (recommended if you just want to run it)
 - Option B: build natively with MSYS2 + SDL backend
 
-Option A: WSL2 (Ubuntu)
+#### Option A: WSL2 (Ubuntu)
+
 1) Install WSL2 and Ubuntu from the Microsoft Store
 2) Inside Ubuntu (WSL2), install prerequisites
    sudo apt-get update
@@ -82,7 +86,8 @@ Option A: WSL2 (Ubuntu)
 4) Run
    - fbdev/evdev requires /dev/fb0 and /dev/input/*, which are typically not available in WSL. Prefer SDL for WSL: follow the SDL steps from macOS above (adjust lv_drv_conf.h and main.c). Then simply run ./weather_app to open a window via the Windows X/Wayland bridge used by SDL.
 
-Option B: Native Windows with MSYS2 + SDL
+#### Option B: Native Windows with MSYS2 + SDL
+
 1) Install MSYS2 from https://www.msys2.org
 2) Open the "MSYS2 UCRT64" terminal and install toolchain and SDL2
    pacman -Syu
@@ -95,7 +100,8 @@ Option B: Native Windows with MSYS2 + SDL
    make clean && make USE_SDL_BACKEND=1
    ./weather_app.exe
 
-Runtime configuration and tuning
+## Runtime configuration and tuning
+
 - Display resolution
   • Defaults to 480x320 (see DISP_HOR_RES and DISP_VER_RES in main.c and LV_HOR_RES_MAX/LV_VER_RES_MAX in lv_conf.h)
   • Override at build time:
@@ -119,7 +125,8 @@ Runtime configuration and tuning
 - Permissions (Linux)
   • If you see errors opening /dev/fb0 or /dev/input/eventX, run with sudo or add your user to the video and input groups
 
-Development setup
+## Development setup
+
 - Project dependencies
   • LVGL core and lv_drivers are pulled by: make setup
   • Compiler: GCC/Clang; Make
@@ -162,9 +169,11 @@ Troubleshooting
   • Verify SDL2 is installed and discoverable (brew doctor; pkg-config --libs sdl2)
   • If pkg-config can't find SDL2, set PKG_CONFIG_PATH accordingly (e.g., export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig" on macOS if needed)
 
-Notes on platforms
+## Notes on platforms
+
 - Linux framebuffer target is ideal for embedded devices, Raspberry Pi (console mode), or headless systems with direct fbdev access.
 - macOS and Windows are best served with an SDL or similar desktop backend. The repository is kept defaulted to Linux fbdev for simplicity; SDL config requires minor code changes as described above.
 
-License
+## License
+
 - This project uses LVGL and lv_drivers under their respective licenses. Consult those repositories for details.
