@@ -70,6 +70,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <linux/i2c-dev.h>
+#endif
+
+#if defined(__linux__) && !defined(DISABLE_BME280)
+#define BME_FEATURE 1
+#else
+#define BME_FEATURE 0
+#endif
 
 #define DISP_BUF_SIZE (320 * 240)  /* Rendering buffer in pixels; may be smaller than the display resolution */
 
@@ -77,8 +89,20 @@
 #define UI_UPDATE_INTERVAL_MS 1000  /* UI refresh timer interval in milliseconds */
 #endif
 
+/* Deprecated: API_REFRESH_SEC retained for backward compatibility; prefer SENSOR_REFRESH_SEC */
 #ifndef API_REFRESH_SEC
 #define API_REFRESH_SEC 30          /* Background API refresh interval in seconds */
+#endif
+#ifdef API_REFRESH_SEC
+#warning "API_REFRESH_SEC is deprecated; use SENSOR_REFRESH_SEC instead"
+#endif
+
+#ifndef SENSOR_REFRESH_SEC
+#ifdef API_REFRESH_SEC
+#define SENSOR_REFRESH_SEC API_REFRESH_SEC
+#else
+#define SENSOR_REFRESH_SEC 30          /* Background sensor refresh interval in seconds */
+#endif
 #endif
 
 #ifndef DISP_HOR_RES
@@ -87,6 +111,16 @@
 
 #ifndef DISP_VER_RES
 #define DISP_VER_RES 320            /* Default vertical resolution for display driver */
+#endif
+
+/* Default Linux I2C device path for BME280 (ensure visible before use) */
+#ifndef BME280_I2C_DEV
+#define BME280_I2C_DEV "/dev/i2c-1"
+#endif
+
+#if BME_FEATURE
+#include "BME280.h"
+#include "I2CDevice.h"
 #endif
 
 /* Color constants (use hex to avoid palette dependency) */
@@ -100,6 +134,12 @@ static lv_obj_t *temp_label;
 static lv_obj_t *pressure_label;
 static lv_obj_t *humidity_label;
 static lv_obj_t *time_label;
+static lv_obj_t *g_source_label_ref = NULL; // track source of data
+
+#if BME_FEATURE
+static unsigned long g_bme_ok = 0;
+static unsigned long g_bme_err = 0;
+#endif
 
 /**
  * weather_data_t
@@ -124,20 +164,37 @@ typedef struct {
 
 static weather_data_t current_data = { .temperature = NAN, .pressure = NAN, .humidity = NAN, .time_str = "" };
 static pthread_mutex_t current_data_mutex = PTHREAD_MUTEX_INITIALIZER;  // Protects access to current_data
-
+static int g_last_source_is_bme = 0;  // 1 if last update used BME, else 0 (no sensor data)
 // Function prototypes
 void hal_init(void);
 void update_display_data(void);
 void *api_update_thread(void *arg);
-float get_temperature_from_api(void);
-float get_pressure_from_api(void);
-float get_humidity_from_api(void);
 void get_current_time(char *time_str, size_t size);
 void *lvgl_tick_thread(void *arg);
 void update_display_timer_cb(lv_timer_t *timer);
+#ifdef __linux__
+static int bme280_init_linux(const char *i2c_path);
+static int bme280_read_raw(float *temp_c, float *press_hpa, float *humid_rh);
+static int bme_is_inited(void);
+static uint8_t bme_get_addr(void);
+#endif
+#if BME_FEATURE
+static const char *g_cli_i2c_path = NULL; // optional CLI override
+#endif
 
-int main(void)
+int main(int argc, char **argv)
 {
+#if BME_FEATURE
+    // Parse command-line for --i2c <path> or --i2c=<path>
+    for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "--i2c=", 7) == 0) {
+            g_cli_i2c_path = argv[i] + 7;
+        } else if (strcmp(argv[i], "--i2c") == 0 && i + 1 < argc) {
+            g_cli_i2c_path = argv[i + 1];
+            ++i;
+        }
+    }
+#endif
     // Initialize LVGL core
     lv_init();
 
@@ -252,6 +309,15 @@ int main(void)
     lv_label_set_text(time_label, "-- : --");
     lv_obj_set_style_text_font(time_label, &lv_font_montserrat_18, LV_PART_MAIN);
     lv_obj_align(time_label, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Add a source/status label at bottom of the window
+    lv_obj_t *src_label = lv_label_create(win_content);
+    lv_label_set_text(src_label, "Source: --");
+    lv_obj_set_style_text_font(src_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(src_label, lv_color_hex(0x607D8B), LV_PART_MAIN); // blue-grey
+    lv_obj_align(src_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    // Keep a handle for updates
+    g_source_label_ref = src_label;
 
     // Start API update thread (periodic data refresh)
     pthread_t api_thread;
@@ -379,25 +445,61 @@ void *lvgl_tick_thread(void *arg)
  */
 void *api_update_thread(void *arg)
 {
+    // Allow override of I2C path via env or argv (argv not available here; we use env only)
+#if BME_FEATURE
+    const char *env_path = getenv("BME280_I2C_DEV");
+    const char *i2c_path = g_cli_i2c_path ? g_cli_i2c_path : (env_path && env_path[0] ? env_path : BME280_I2C_DEV);
+#endif
     while(1) {
-        // Fetch data from APIs (placeholder implementations below)
-        float t = get_temperature_from_api();
-        float p = get_pressure_from_api();
-        float h = get_humidity_from_api();
+#if BME_FEATURE
+        static int bme_tried = 0;
+        if (!bme_tried) {
+            if (bme280_init_linux(i2c_path) == 0) {
+                printf("BME280 initialized over I2C at %s (addr 0x%02X)\n", i2c_path, (unsigned)bme_get_addr());
+            } else {
+                printf("BME280 not found on %s; sensor data unavailable.\n", i2c_path);
+            }
+            bme_tried = 1;
+        }
+#endif
+        float t = NAN, p = NAN, h = NAN;
+        int inc_ok = 0, inc_err = 0;
+        int last_is_bme = 0;
+#if BME_FEATURE
+        if (bme_is_inited()) {
+            if (bme280_read_raw(&t, &p, &h) != 0) {
+                // if a read fails, keep values as NAN
+                t = NAN; p = NAN; h = NAN;
+                inc_err = 1;
+                last_is_bme = 0;
+             } else {
+                inc_ok = 1;
+                last_is_bme = 1;
+             }
+        } else {
+            last_is_bme = 0;
+        }
+#else
+        // No BME feature compiled in
+        last_is_bme = 0;
+#endif
         char ts[sizeof current_data.time_str];
         get_current_time(ts, sizeof(ts));
 
-        // Commit new snapshot atomically for the GUI thread to consume
         pthread_mutex_lock(&current_data_mutex);
         current_data.temperature = t;
         current_data.pressure = p;
         current_data.humidity = h;
         strncpy(current_data.time_str, ts, sizeof(current_data.time_str));
         current_data.time_str[sizeof(current_data.time_str) - 1] = '\0';
+        g_last_source_is_bme = last_is_bme;
+#if BME_FEATURE
+        if (inc_ok) g_bme_ok++;
+        if (inc_err) g_bme_err++;
+#endif
         pthread_mutex_unlock(&current_data_mutex);
 
-        // Wait 30 seconds before next update
-        sleep(API_REFRESH_SEC);
+        sleep(SENSOR_REFRESH_SEC);
     }
     return NULL;
 }
@@ -423,12 +525,20 @@ void update_display_data(void)
 
     // Take a thread-safe snapshot of the latest data
     float t, p, h;
+    int last_is_bme_snapshot = 0;
+    unsigned long bme_ok_snapshot = 0;
+    unsigned long bme_err_snapshot = 0;
     pthread_mutex_lock(&current_data_mutex);
     t = current_data.temperature;
     p = current_data.pressure;
     h = current_data.humidity;
     strncpy(time_str, current_data.time_str, sizeof(time_str));
     time_str[sizeof(time_str) - 1] = '\0';
+    last_is_bme_snapshot = g_last_source_is_bme;
+#if BME_FEATURE
+    bme_ok_snapshot = g_bme_ok;
+    bme_err_snapshot = g_bme_err;
+#endif
     pthread_mutex_unlock(&current_data_mutex);
 
     // Format temperature
@@ -460,6 +570,25 @@ void update_display_data(void)
     lv_label_set_text(pressure_label, pressure_str);
     lv_label_set_text(humidity_label, humidity_str);
     lv_label_set_text(time_label, time_to_show);
+    
+    // Update source label
+    if (g_source_label_ref) {
+#if BME_FEATURE
+        if (bme_is_inited() && last_is_bme_snapshot) {
+            char srcbuf[64];
+            snprintf(srcbuf, sizeof(srcbuf), "Source: BME280 (ok=%lu err=%lu)", bme_ok_snapshot, bme_err_snapshot);
+            lv_label_set_text(g_source_label_ref, srcbuf);
+        } else if (bme_is_inited()) {
+            char srcbuf[64];
+            snprintf(srcbuf, sizeof(srcbuf), "Source: BME280 (read error, err=%lu)", bme_err_snapshot);
+            lv_label_set_text(g_source_label_ref, srcbuf);
+        } else {
+            lv_label_set_text(g_source_label_ref, "Source: BME280 unavailable");
+        }
+#else
+        lv_label_set_text(g_source_label_ref, "Source: BME280 disabled at build time");
+#endif
+    }
 }
 
 /**
@@ -472,48 +601,7 @@ void update_display_timer_cb(lv_timer_t *timer)
     update_display_data();
 }
 
-// API placeholder functions - implement these to connect to actual weather APIs
-/**
- * get_temperature_from_api
- * Placeholder that simulates a temperature reading from a weather API.
- * return: temperature in Celsius
- */
-float get_temperature_from_api(void)
-{
-    // TODO: Implement actual API call to weather service (e.g., libcurl + JSON)
-    printf("Fetching temperature from API...\n");
-    
-    // Simulate API response
-    return 22.5f; // Dummy temperature in Celsius
-}
-
-/**
- * get_pressure_from_api
- * Placeholder that simulates an atmospheric pressure reading from a weather API.
- * return: pressure in hPa
- */
-float get_pressure_from_api(void)
-{
-    // TODO: Implement actual API call to weather service
-    printf("Fetching pressure from API...\n");
-    
-    // Simulate API response
-    return 1013.2f; // Dummy pressure in hPa
-}
-
-/**
- * get_humidity_from_api
- * Placeholder that simulates a relative humidity reading from a weather API.
- * return: humidity percent (0..100)
- */
-float get_humidity_from_api(void)
-{
-    // TODO: Implement actual API call to weather service
-    printf("Fetching humidity from API...\n");
-    
-    // Simulate API response
-    return 65.0f; // Dummy humidity percentage
-}
+// Dummy API functions removed: data now only comes from BME280 (if available) and system clock
 
 /**
  * get_current_time
@@ -534,3 +622,93 @@ void get_current_time(char *time_str, size_t size)
     localtime_r(&rawtime, &timeinfo);
     strftime(time_str, size, "%H:%M", &timeinfo);
 }
+
+/* Minimal BME280 state and helpers (Linux I2C). Falls back to dummy API if unavailable. */
+#ifdef __linux__
+#if BME_FEATURE
+static I2CDevice g_i2c_dev = { .fd = -1 };
+static bme280_t g_bme_dev;
+static int bme_inited = 0;
+static uint8_t bme_addr = 0;
+/* g_bme_ok/g_bme_err are defined at the top-level (one definition only) */
+
+static int bme_bus_read(void *user, uint8_t reg, uint8_t *buf, size_t len) {
+    I2CDevice *dev = (I2CDevice *)user;
+    return i2c_device_read_reg(dev, reg, buf, len, 1) == 0 ? 0 : BME280_E_COMM;
+}
+
+static int bme_bus_write(void *user, uint8_t reg, const uint8_t *buf, size_t len) {
+    I2CDevice *dev = (I2CDevice *)user;
+    return i2c_device_write_reg(dev, reg, buf, len, 1) == 0 ? 0 : BME280_E_COMM;
+}
+
+static void bme_bus_delay(void *user, uint32_t ms) {
+    (void)user;
+    usleep(ms * 1000);
+}
+
+static int bme280_init_try_addr(const char *i2c_path, uint8_t addr) {
+    if (i2c_device_open(&g_i2c_dev, i2c_path, addr) != 0) return -1;
+    bme280_bus_t bus = {
+        .read = bme_bus_read,
+        .write = bme_bus_write,
+        .delay_ms = bme_bus_delay,
+        .user = &g_i2c_dev
+    };
+    int rc = bme280_init(&g_bme_dev, &bus, addr);
+    if (rc != BME280_OK) {
+        i2c_device_close(&g_i2c_dev);
+        return -1;
+    }
+    /* Configure a simple continuous measurement */
+    bme280_set_oversampling(&g_bme_dev, BME280_OSRS_X1, BME280_OSRS_X1, BME280_OSRS_X1);
+    bme280_set_filter(&g_bme_dev, BME280_FILTER_OFF);
+    bme280_set_standby(&g_bme_dev, BME280_STANDBY_1000_MS);
+    bme280_set_mode(&g_bme_dev, BME280_NORMAL_MODE);
+    pthread_mutex_lock(&current_data_mutex);
+    bme_addr = addr;
+    bme_inited = 1;
+    pthread_mutex_unlock(&current_data_mutex);
+    return 0;
+}
+
+static int bme280_init_linux(const char *i2c_path) {
+    if (bme_is_inited()) return 0;
+    const uint8_t addrs[] = { BME280_I2C_ADDR_SDO_HIGH, BME280_I2C_ADDR_SDO_LOW };
+    for (size_t i = 0; i < sizeof(addrs)/sizeof(addrs[0]); ++i) {
+        if (bme280_init_try_addr(i2c_path, addrs[i]) == 0) return 0;
+    }
+    return -1;
+}
+
+static int bme280_read_raw(float *temp_c, float *press_hpa, float *humid_rh) {
+    if (!bme_is_inited()) return -1;
+    bme280_reading_t r;
+    int rc = bme280_read_measurement(&g_bme_dev, &r);
+    if (rc != BME280_OK) return -1;
+    if (temp_c) *temp_c = r.temperature_c;
+    if (press_hpa) *press_hpa = r.pressure_pa / 100.0f; /* Pa -> hPa */
+    if (humid_rh) *humid_rh = r.humidity_rh;
+    return 0;
+}
+
+static int bme_is_inited(void) {
+    int v;
+    pthread_mutex_lock(&current_data_mutex);
+    v = bme_inited;
+    pthread_mutex_unlock(&current_data_mutex);
+    return v;
+}
+static uint8_t bme_get_addr(void) {
+    uint8_t a;
+    pthread_mutex_lock(&current_data_mutex);
+    a = bme_addr;
+    pthread_mutex_unlock(&current_data_mutex);
+    return a;
+}
+#endif /* BME_FEATURE */
+#endif /* __linux__ */
+
+
+/* Remove legacy BME280 low-level implementation and duplicate defines */
+// (Old ad-hoc I2C helpers and BME280_REG_* definitions replaced by BME280 driver)

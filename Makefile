@@ -1,9 +1,20 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -O3 -g0 -Wall -Wextra -Wshadow -Wundef -Wmissing-prototypes -Wno-discarded-qualifiers -Wno-unused-function -Wno-error=strict-prototypes -Wpointer-arith -fno-strict-aliasing -Wno-error=cpp -Wuninitialized -Wmaybe-uninitialized -Wno-unused-parameter -Wno-missing-field-initializers -Wtype-limits -Wsizeof-pointer-memaccess -Wno-format-nonliteral -Wno-cast-qual -Wunreachable-code -Wno-switch-default -Wreturn-type -Wmultichar -Wformat-security -Wno-ignored-qualifiers -Wno-error=pedantic -Wno-sign-compare -Wno-error=missing-prototypes -Wdouble-promotion -Wclobbered -Wdeprecated -Wempty-body -Wshift-negative-value -Wstack-usage=2048
+
+# Enforce Linux (Debian) 64-bit environment
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifneq ($(UNAME_S),Linux)
+$(error This Makefile targets Linux (Debian) x86_64 only)
+endif
+ifneq ($(UNAME_M),x86_64)
+$(error This Makefile targets Linux (Debian) x86_64 only)
+endif
+
+CFLAGS = -m64 -O3 -g0 -Wall -Wextra -Wshadow -Wundef -Wmissing-prototypes -Wno-discarded-qualifiers -Wno-unused-function -Wno-error=strict-prototypes -Wpointer-arith -fno-strict-aliasing -Wno-error=cpp -Wuninitialized -Wmaybe-uninitialized -Wno-unused-parameter -Wno-missing-field-initializers -Wtype-limits -Wsizeof-pointer-memaccess -Wno-format-nonliteral -Wno-cast-qual -Wunreachable-code -Wno-switch-default -Wreturn-type -Wmultichar -Wformat-security -Wno-ignored-qualifiers -Wno-error=pedantic -Wno-sign-compare -Wno-error=missing-prototypes -Wdouble-promotion -Wclobbered -Wdeprecated -Wempty-body -Wshift-negative-value -Wstack-usage=2048 -D_GNU_SOURCE
 
 # Libraries
-LDFLAGS = -lm -lpthread
+LDFLAGS = -m64 -lm -lpthread
 
 # LVGL configuration
 LVGL_DIR_NAME = lvgl
@@ -17,6 +28,13 @@ include $(LVGL_DIR)/lvgl/lvgl.mk
 include $(LVGL_DIR)/lv_drivers/lv_drivers.mk
 
 CSRCS += main.c
+# Include portable BME280 driver by default
+CSRCS += BME280.c
+
+# Allow disabling BME280 at build time: `make DISABLE_BME280=1`
+ifeq ($(DISABLE_BME280),1)
+CFLAGS += -DDISABLE_BME280
+endif
 
 # Object files
 OBJEXT = .o
